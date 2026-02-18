@@ -8,9 +8,20 @@ import asyncio
 import websockets
 import json
 import ssl
+import sys
+from pathlib import Path
 
-ELEVENLABS_API_KEY = "sk_26c0f50f00630172542f2839b7da058b5c7ebeb4e7e6fdc3"
-ELEVENLABS_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&language_code=en"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from servers.config import get_env
+
+ELEVENLABS_API_KEY = get_env("ELEVENLABS_API_KEY", "")
+ELEVENLABS_WS_URL = get_env(
+    "ELEVENLABS_WS_URL",
+    "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&language_code=en"
+)
 
 app = FastAPI()
 
@@ -18,6 +29,11 @@ app = FastAPI()
 async def websocket_proxy(client_ws: WebSocket):
     await client_ws.accept()
     print("Client connected")
+
+    if not ELEVENLABS_API_KEY:
+        await client_ws.send_json({"error": "ELEVENLABS_API_KEY is not configured. Set it in .env."})
+        await client_ws.close(code=1011)
+        return
 
     try:
         # Create SSL context that doesn't verify certificates
@@ -28,7 +44,7 @@ async def websocket_proxy(client_ws: WebSocket):
         # Connect to ElevenLabs with API key in header
         headers = {"xi-api-key": ELEVENLABS_API_KEY}
         print(f"Connecting to: {ELEVENLABS_WS_URL}")
-        print(f"With headers: {headers}")
+        print("Using xi-api-key header from environment configuration.")
 
         async with websockets.connect(
             ELEVENLABS_WS_URL,
