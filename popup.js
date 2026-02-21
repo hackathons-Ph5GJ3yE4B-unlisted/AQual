@@ -865,7 +865,7 @@ function bindEvents() {
           docId: data.docId
         }
       }, () => {
-        status.textContent = "Opening bionic viewer...";
+        status.textContent = "Opening Reading Assist viewer...";
         chrome.tabs.create({ url: chrome.runtime.getURL("bionic-viewer.html") });
       });
     } catch (error) {
