@@ -1,4 +1,4 @@
-<p align="right">[This repository is published from an unlisted username to keep the project source unlisted for now. Main account: IntegralByte.]</p>
+[This repository is published from an unlisted username to keep the project source unlisted for now. Main account: integralbyte.]
 
 # AQual
 
