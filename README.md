@@ -2,7 +2,7 @@
 
 # AQual
 
-![AQual cover](AQual%20Logo.png)
+![AQual cover](Cover%20Photo.png)
 
 AQual is a browser accessibility extension that helps people read, navigate, and interact with web pages more comfortably. It combines visual controls, voice interaction, ring hardware input, and document support in one interface.
 
