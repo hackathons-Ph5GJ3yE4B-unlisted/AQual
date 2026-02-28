@@ -203,11 +203,17 @@ let geminiLiveHideTimer = null;
 let ringEventPollTimer = null;
 let ringEventPollInFlight = false;
 let ringEventCursor = 0;
+let ringEventCursorHydrated = false;
 let ringEventLastToggleAt = 0;
 let ringEventLastActionAt = Object.create(null);
+const ringEventSessionStartedAtMs = Date.now();
+let ringEventVisibilityListenerBound = false;
 let readingModeRequestId = 0;
 let readingModeRequestInFlight = false;
 let readingModeAbortController = null;
+let skyscannerRingSelectedElement = null;
+let skyscannerRingSelectedIndex = -1;
+let skyscannerRingSelectedUrl = "";
 
 const HIGH_CONTRAST_CURSOR_MAP = {
   "arrow-large.png": "arrow-large-white.png",
@@ -227,10 +233,18 @@ const READING_MODE_PLAN_ENDPOINT = `${DOC_SERVER_BASE}/reading-mode-plan`;
 const READING_MODE_REQUEST_TIMEOUT_MS = 18000;
 const READING_MODE_MAX_HTML_CHARS = 450000;
 const READING_MODE_DEBUG_LOGS = true;
-const RING_EVENT_POLL_ENDPOINT = `${DOC_SERVER_BASE}/ring-event/poll`;
+const FEATURE_TRACE_LOGS = true;
 const RING_EVENT_POLL_INTERVAL_MS = 1400;
 const RING_EVENT_LOCAL_DEBOUNCE_MS = 260;
 const RING_EVENT_POLL_DEFAULTS = { aqualRingBackendPollingEnabled: true };
+const RING_EVENT_CURSOR_STORAGE_KEY = "aqualRingEventCursor";
+const RING_EVENT_INITIAL_SYNC_GRACE_MS = 800;
+const SKYSCANNER_RING_RESULTS_XPATH = "/html/body/div[1]/div[5]/div/main/div/div[1]/div/div/div/div[1]/ul/li[*]";
+const SKYSCANNER_RING_RESULTS_FALLBACK_SELECTORS = [
+  "[data-testid='ticket']",
+  "[data-testid='day-list-item'] [data-testid='ticket']",
+  "[data-testid='search-results'] [data-testid='ticket']"
+];
 const RING_BUTTON_ACTION_DEFAULTS = {
   right: "toggle_image_veil",
   left: "toggle_line_guide",
@@ -348,7 +362,7 @@ function resetAllVisualEffects() {
   toggleNightMode(false);
   applyDimming(false, state.dimmingLevel);
   applyBlueLight(false, state.blueLightLevel);
-  setLineGuideEnabled(false);
+  setLineGuideEnabled(false, "reset_all_visual_effects");
 }
 
 function readingModeDebug(eventName, details) {
@@ -363,6 +377,62 @@ function readingModeDebug(eventName, details) {
   } catch (_error) {
     console.info("[aqual-reading-mode]", eventName, details || "");
   }
+}
+
+function featureTrace(eventName, details) {
+  if (!FEATURE_TRACE_LOGS || window.top !== window) return;
+  const payload = {
+    event: String(eventName || ""),
+    href: window.location.href,
+    ts: Date.now(),
+    ...(details && typeof details === "object" ? details : {})
+  };
+  try {
+    console.info("[aqual-feature-trace]", JSON.stringify(payload));
+  } catch (_error) {
+    console.info("[aqual-feature-trace]", eventName, details || "");
+  }
+}
+
+function normalizeRingCursorValue(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(parsed));
+}
+
+function persistRingEventCursor(nextCursor) {
+  const safeCursor = normalizeRingCursorValue(nextCursor);
+  try {
+    if (!chrome || !chrome.storage || !chrome.storage.local) return;
+    chrome.storage.local.set(
+      { [RING_EVENT_CURSOR_STORAGE_KEY]: safeCursor },
+      () => {
+        if (chrome.runtime && chrome.runtime.lastError) {
+          // Ignore cursor persistence errors; polling still works in-memory.
+        }
+      }
+    );
+  } catch (_error) {
+    // Ignore storage availability errors in transient contexts.
+  }
+}
+
+function parseRingEventTimestampMs(entry) {
+  const raw = Number(entry && entry.timestamp);
+  if (!Number.isFinite(raw) || raw <= 0) return NaN;
+  if (raw > 1e12) return raw;
+  return raw * 1000;
+}
+
+function describeApplyMeta(meta, fallbackSource = "settings") {
+  if (!meta || typeof meta !== "object") {
+    return `${fallbackSource}:unknown`;
+  }
+  const source = String(meta.source || "unknown").trim().toLowerCase() || "unknown";
+  const reason = String(meta.reason || "").trim().toLowerCase();
+  return reason ? `${fallbackSource}:${source}:${reason}` : `${fallbackSource}:${source}`;
 }
 
 function updateReadingModeStatus(status, detail = "", extra = null) {
@@ -1764,7 +1834,7 @@ function applyMagnifier(enabled, size, zoom) {
   }
 }
 
-function applySettings(incoming) {
+function applySettings(incoming, applyMeta = null) {
   if (isGoogleMapsUrl()) {
     resetAllVisualEffects();
     state = normalizeSettings(incoming);
@@ -1859,7 +1929,7 @@ function applySettings(incoming) {
   }
 
   if (next.lineGuideEnabled !== state.lineGuideEnabled) {
-    setLineGuideEnabled(next.lineGuideEnabled);
+    setLineGuideEnabled(next.lineGuideEnabled, describeApplyMeta(applyMeta, "settings_apply"));
   }
 
   state = next;
@@ -2528,6 +2598,232 @@ function resolveSkyscannerProviderFromPayload(payload) {
   return { ok: false, error: `No provider matched "${providerKeywordRaw}".` };
 }
 
+function isSkyscannerFlightsResultsPageUrl(rawUrl) {
+  const absolute = parseHttpUrl(rawUrl);
+  if (!absolute) return false;
+  try {
+    const parsed = new URL(absolute);
+    if (!isSkyscannerHost(parsed.hostname)) return false;
+    if (!parsed.pathname.includes("/transport/flights/")) return false;
+    if (parsed.pathname.includes("/config/")) return false;
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function isSkyscannerRingCandidateElement(element) {
+  if (!(element instanceof Element) || !element.isConnected) return false;
+  const rect = element.getBoundingClientRect();
+  if (rect.width > 0 && rect.height > 0) return true;
+  const clientRects = element.getClientRects();
+  if (clientRects && clientRects.length > 0) return true;
+  const nestedTicket = element.querySelector && element.querySelector("[data-testid='ticket']");
+  if (nestedTicket && nestedTicket !== element) {
+    const nestedRect = nestedTicket.getBoundingClientRect();
+    return nestedRect.width > 0 && nestedRect.height > 0;
+  }
+  return false;
+}
+
+function resolveSkyscannerRingItemElement(node) {
+  if (!(node instanceof Element)) return null;
+  if (node.matches("[data-testid='ticket']")) return node;
+  const nestedTicket = node.querySelector("[data-testid='ticket']");
+  if (nestedTicket instanceof Element) return nestedTicket;
+  return node;
+}
+
+function clearSkyscannerRingSelection() {
+  if (skyscannerRingSelectedElement && skyscannerRingSelectedElement.classList) {
+    skyscannerRingSelectedElement.classList.remove("aqual-skyscanner-ring-target");
+  }
+  skyscannerRingSelectedElement = null;
+  skyscannerRingSelectedIndex = -1;
+}
+
+function collectSkyscannerRingResultItemsByXPath(xpathExpression) {
+  const items = [];
+  const seen = new Set();
+  try {
+    const result = document.evaluate(
+      xpathExpression,
+      document,
+      null,
+      XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+      null
+    );
+    for (let i = 0; i < result.snapshotLength; i += 1) {
+      const node = result.snapshotItem(i);
+      const candidate = resolveSkyscannerRingItemElement(node);
+      if (!isSkyscannerRingCandidateElement(candidate)) continue;
+      if (seen.has(candidate)) continue;
+      seen.add(candidate);
+      items.push(candidate);
+    }
+  } catch (_error) {
+    return [];
+  }
+  return items;
+}
+
+function collectSkyscannerRingResultItems() {
+  const direct = collectSkyscannerRingResultItemsByXPath(SKYSCANNER_RING_RESULTS_XPATH);
+  if (direct.length) {
+    return direct;
+  }
+
+  const items = [];
+  const seen = new Set();
+  SKYSCANNER_RING_RESULTS_FALLBACK_SELECTORS.forEach((selector) => {
+    let matches = [];
+    try {
+      matches = Array.from(document.querySelectorAll(selector));
+    } catch (_error) {
+      matches = [];
+    }
+    matches.forEach((node) => {
+      const candidate = resolveSkyscannerRingItemElement(node);
+      if (!isSkyscannerRingCandidateElement(candidate)) return;
+      if (seen.has(candidate)) return;
+      seen.add(candidate);
+      items.push(candidate);
+    });
+  });
+  return items;
+}
+
+function getSkyscannerRingPageKey(rawUrl) {
+  const absolute = parseHttpUrl(rawUrl);
+  if (!absolute) return "";
+  try {
+    const parsed = new URL(absolute);
+    parsed.hash = "";
+    return parsed.toString();
+  } catch (_error) {
+    return absolute;
+  }
+}
+
+function setSkyscannerRingSelection(element, index, total) {
+  if (!isSkyscannerRingCandidateElement(element)) {
+    return { ok: false, error: "Could not select this result item." };
+  }
+
+  if (skyscannerRingSelectedElement && skyscannerRingSelectedElement !== element) {
+    skyscannerRingSelectedElement.classList.remove("aqual-skyscanner-ring-target");
+  }
+
+  skyscannerRingSelectedElement = element;
+  skyscannerRingSelectedIndex = index;
+  skyscannerRingSelectedElement.classList.add("aqual-skyscanner-ring-target");
+  skyscannerRingSelectedElement.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+  return {
+    ok: true,
+    index: index + 1,
+    total
+  };
+}
+
+function moveSkyscannerRingSelection(offset) {
+  if (!isSkyscannerFlightsResultsPageUrl(window.location.href)) {
+    clearSkyscannerRingSelection();
+    return { ok: false, error: "Skyscanner navigation is only available on flight results pages." };
+  }
+
+  const currentUrl = getSkyscannerRingPageKey(window.location.href);
+  if (currentUrl !== skyscannerRingSelectedUrl) {
+    clearSkyscannerRingSelection();
+    skyscannerRingSelectedUrl = currentUrl;
+  }
+
+  const items = collectSkyscannerRingResultItems();
+  if (!items.length) {
+    clearSkyscannerRingSelection();
+    return { ok: false, error: "No flight result items were found on this page." };
+  }
+
+  let currentIndex = items.indexOf(skyscannerRingSelectedElement);
+  if (currentIndex < 0 && skyscannerRingSelectedIndex >= 0 && skyscannerRingSelectedIndex < items.length) {
+    currentIndex = skyscannerRingSelectedIndex;
+  }
+
+  let nextIndex = 0;
+  if (currentIndex >= 0) {
+    nextIndex = (currentIndex + Number(offset || 0) + items.length) % items.length;
+  }
+
+  return setSkyscannerRingSelection(items[nextIndex], nextIndex, items.length);
+}
+
+function activateSkyscannerRingSelection() {
+  const selection = moveSkyscannerRingSelection(0);
+  if (!selection.ok) {
+    return selection;
+  }
+
+  const item = skyscannerRingSelectedElement;
+  if (!isSkyscannerRingCandidateElement(item)) {
+    return { ok: false, error: "No selected flight result was available." };
+  }
+
+  const typedButton = item.querySelector("button[type='button']:not([disabled])");
+  const fallbackButton = item.querySelector("button:not([disabled])");
+  const button = typedButton || fallbackButton;
+  if (!button) {
+    return { ok: false, error: "No button was found inside the selected result item." };
+  }
+
+  try {
+    button.focus({ preventScroll: true });
+  } catch (_error) {
+    // Ignore focus errors and still click.
+  }
+  button.click();
+
+  const clickedLabel = String(button.getAttribute("aria-label") || button.textContent || "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    ok: true,
+    index: selection.index,
+    total: selection.total,
+    clickedLabel
+  };
+}
+
+function isSkyscannerRingNavButton(buttonLabel) {
+  const button = String(buttonLabel || "").trim().toLowerCase();
+  return (
+    button === "top"
+    || button === "bottom"
+    || button === "up"
+    || button === "down"
+    || button === "center"
+    || button === "middle"
+    || button === "enter"
+  );
+}
+
+function performSkyscannerRingNavigation(buttonLabel) {
+  if (!isSkyscannerFlightsResultsPageUrl(window.location.href)) return false;
+  const button = String(buttonLabel || "").trim().toLowerCase();
+  if (button === "top" || button === "up") {
+    const result = moveSkyscannerRingSelection(-1);
+    return Boolean(result && result.ok);
+  }
+  if (button === "bottom" || button === "down") {
+    const result = moveSkyscannerRingSelection(1);
+    return Boolean(result && result.ok);
+  }
+  if (button === "center" || button === "middle" || button === "enter") {
+    const result = activateSkyscannerRingSelection();
+    return Boolean(result && result.ok);
+  }
+  return false;
+}
+
 function normalizeLearnText(value) {
   return String(value || "")
     .toLowerCase()
@@ -2595,6 +2891,81 @@ async function scrollLearnToBottom(maxPasses = 5) {
     }
     previousHeight = settledHeight;
   }
+}
+
+function canLearnElementScrollY(element) {
+  if (!(element instanceof Element)) return false;
+  const style = window.getComputedStyle(element);
+  if (!style) return false;
+  const overflowY = String(style.overflowY || "").toLowerCase();
+  const allowsScroll = overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+  if (!allowsScroll) return false;
+  return element.scrollHeight > (element.clientHeight + 4);
+}
+
+function findLearnScrollContainer(preferredNode = null) {
+  let cursor = preferredNode instanceof Element ? preferredNode : null;
+  while (cursor) {
+    if (canLearnElementScrollY(cursor)) {
+      return cursor;
+    }
+    cursor = cursor.parentElement;
+  }
+
+  const fallbackCandidates = [
+    document.querySelector("main"),
+    document.querySelector("#site-wrap"),
+    document.querySelector("section"),
+    document.querySelector("body")
+  ];
+  for (let i = 0; i < fallbackCandidates.length; i += 1) {
+    if (canLearnElementScrollY(fallbackCandidates[i])) {
+      return fallbackCandidates[i];
+    }
+  }
+  return document.scrollingElement || document.documentElement || document.body;
+}
+
+function scrollLearnContainerBy(container, amountPx) {
+  const offset = Math.round(Number(amountPx) || 0);
+  if (!offset) return;
+  const scrollingRoot = document.scrollingElement || document.documentElement || document.body;
+  const isWindowRoot = (
+    !container
+    || container === scrollingRoot
+    || container === document.documentElement
+    || container === document.body
+  );
+
+  if (!isWindowRoot && container instanceof Element) {
+    try {
+      if (typeof container.scrollBy === "function") {
+        container.scrollBy({ top: offset, behavior: "smooth" });
+        return;
+      }
+    } catch (_error) {
+      // Fall through to direct scrollTop update.
+    }
+    container.scrollTop += offset;
+    return;
+  }
+
+  try {
+    window.scrollBy({ top: offset, behavior: "smooth" });
+  } catch (_error) {
+    window.scrollBy(0, offset);
+  }
+}
+
+async function scrollLearnAfterElementOpen(preferredNode = null) {
+  const firstStep = Math.max(460, Math.round(window.innerHeight * 0.62));
+  const secondStep = Math.max(180, Math.round(window.innerHeight * 0.26));
+  const firstTarget = findLearnScrollContainer(preferredNode);
+  scrollLearnContainerBy(firstTarget, firstStep);
+  await waitForLearnUi(1000);
+  const secondTarget = findLearnScrollContainer(preferredNode);
+  scrollLearnContainerBy(secondTarget, secondStep);
+  await waitForLearnUi(260);
 }
 
 function activateLearnElement(target) {
@@ -2811,6 +3182,124 @@ async function openLearnContentCardByQuery(query) {
   };
 }
 
+function collectLearnAssessmentFolderCandidates() {
+  const selectors = [
+    "button[data-analytics-id='content.item.folder.toggleFolder.button']",
+    "button[data-analytics-id*='content.item.folder.toggleFolder']",
+    "button.ax-focusable-title[aria-controls^='folder-contents-']",
+    "button.ax-focusable-title[aria-expanded]",
+    "button[id^='folder-title-'][aria-controls]"
+  ];
+  const seen = new Set();
+  const results = [];
+
+  selectors.forEach((selector) => {
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll(selector));
+    } catch (_error) {
+      nodes = [];
+    }
+    nodes.forEach((button) => {
+      if (!(button instanceof Element) || seen.has(button) || isLearnReviewStateButton(button)) return;
+      seen.add(button);
+      if (!isElementLikelyVisible(button)) return;
+      const row = button.closest("[data-content-id], .itemContainer, .content-list-item, [class*='itemContainer'], li, article, section, div");
+      const label = [
+        button.getAttribute("aria-label") || "",
+        button.textContent || "",
+        row && row.textContent ? row.textContent : ""
+      ].join(" ").replace(/\s+/g, " ").trim();
+      results.push({
+        button,
+        row,
+        label
+      });
+    });
+  });
+
+  return results;
+}
+
+function pickLearnAssessmentFolderCandidate(query, fallbackKeyword = "assessment") {
+  const candidates = collectLearnAssessmentFolderCandidates();
+  if (!candidates.length) return null;
+
+  const normalizedQuery = normalizeLearnText(query);
+  const normalizedFallback = normalizeLearnText(fallbackKeyword);
+  let best = null;
+
+  for (let i = 0; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    const labelNormalized = normalizeLearnText(candidate.label);
+    let score = normalizedQuery ? getLearnTextScore(normalizedQuery, candidate.label) : 0;
+    if (normalizedFallback && labelNormalized.includes(normalizedFallback)) {
+      score = Math.max(score, 0.95);
+    }
+    if (!best || score > best.score) {
+      best = { ...candidate, score };
+    }
+  }
+
+  if (!best) return null;
+  if (
+    normalizedQuery
+    && best.score < 0.22
+    && normalizedFallback
+    && !normalizeLearnText(best.label).includes(normalizedFallback)
+  ) {
+    return null;
+  }
+  return {
+    ...best,
+    score: Number(best.score.toFixed(3))
+  };
+}
+
+async function openLearnAssessmentFolderByQuery(query) {
+  const fallbackKeyword = "assessment";
+  const targetQuery = String(query || fallbackKeyword).trim() || fallbackKeyword;
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const candidate = pickLearnAssessmentFolderCandidate(targetQuery, fallbackKeyword);
+    if (candidate && candidate.button) {
+      const button = candidate.button;
+      try {
+        button.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+      } catch (_error) {
+        // Ignore scroll failures.
+      }
+      await waitForLearnUi(180);
+
+      const expanded = String(button.getAttribute("aria-expanded") || "").toLowerCase() === "true";
+      let url = "";
+      if (!expanded) {
+        url = activateLearnElement(button) || "";
+      } else {
+        try {
+          button.focus({ preventScroll: true });
+        } catch (_error) {
+          // Ignore focus failures.
+        }
+      }
+      return {
+        ok: true,
+        label: candidate.label,
+        score: candidate.score,
+        button,
+        row: candidate.row || null,
+        alreadyOpen: expanded,
+        url
+      };
+    }
+
+    await scrollLearnToBottom(2);
+    await waitForLearnUi(260);
+  }
+
+  return { ok: false, error: `No assessment folder matched "${targetQuery}".` };
+}
+
 const LEARN_ASSESSMENT_CARD_XPATH = "//*[@id=\"site-wrap\"]/div[2]/section/div/div/main/div/section/div/div[2]/div/div/course-content-outline/react-course-content-outline/div/div/div[1]/div[2]/div[*]";
 const LEARN_COURSEWORK_CARD_XPATH = "/html/body/div[1]/div[2]/section/div/div/main/div/section/div/div[2]/div/div/course-content-outline/react-course-content-outline/div/div/div[1]/div[2]/div[8]/div/div[2]/div/div/div/div/div[1]/div[2]/div[*]";
 const LEARN_COURSEWORK_FINAL_CLICK_XPATH = "/html/body/div[1]/div[2]/section/div/div/main/div/section/div/div[2]/div/div/course-content-outline/react-course-content-outline/div/div/div[1]/div[2]/div[8]/div/div[2]/div/div/div/div/div[1]/div[2]/div[5]/div/div[2]/div/div/div/div/div[1]/div[2]";
@@ -2844,18 +3333,42 @@ function getLearnNodeLabel(node) {
   ].join(" ").replace(/\s+/g, " ").trim();
 }
 
+function isLearnReviewStateButton(node) {
+  if (!(node instanceof Element) || !node.matches || !node.matches("button")) return false;
+  const className = String(node.className || "");
+  const analyticsId = String(node.getAttribute("data-analytics-id") || "").toLowerCase();
+  const role = String(node.getAttribute("role") || "").toLowerCase();
+  const ariaLabel = String(node.getAttribute("aria-label") || "").toLowerCase();
+  if (className.includes("js-review-state-icon-button")) return true;
+  if (analyticsId.includes("review-state-icon-button")) return true;
+  if (role === "checkbox" && ariaLabel.startsWith("status for")) return true;
+  return false;
+}
+
 function getLearnClickableNode(node) {
   if (!node) return null;
+  const preferredSelector = "button.ax-focusable-title, button[data-analytics-id*='content.item.folder.toggleFolder'], a.ax-focusable-title, a[data-analytics-id*='content.item'], a[data-analytics-id*='document.link'], a[href], button:not(.js-review-state-icon-button), [role='button'], [tabindex]";
+
+  if (isLearnReviewStateButton(node)) {
+    const parentRow = node.closest("[data-content-id], .itemContainer, .content-list-item, [class*='itemContainer'], li, article, section, div");
+    if (parentRow && parentRow !== node && parentRow.querySelector) {
+      const resolved = parentRow.querySelector(preferredSelector);
+      if (resolved && !isLearnReviewStateButton(resolved)) {
+        return resolved;
+      }
+    }
+  }
+
   if (
     node.matches
     && node.matches("a[href], button, [role='button'], [tabindex]")
+    && !isLearnReviewStateButton(node)
   ) {
     return node;
   }
   if (!node.querySelector) return null;
-  return node.querySelector(
-    "button.ax-focusable-title, a.ax-focusable-title, a[data-analytics-id*='content.item'], a[data-analytics-id*='document.link'], a[href], button, [role='button'], [tabindex]"
-  );
+  const found = node.querySelector(preferredSelector);
+  return found && !isLearnReviewStateButton(found) ? found : null;
 }
 
 function openLearnXPathCardByQuery(expression, query, fallbackKeyword = "") {
@@ -3028,13 +3541,24 @@ async function resolveLearnActionFromPayload(payload) {
   }
 
   if (action === "open-assessments") {
-    await scrollLearnToBottom(5);
+    await scrollLearnToBottom(6);
     const query = String(payload && payload.query ? payload.query : "assessment");
+    const folderOpened = await openLearnAssessmentFolderByQuery(query);
+    if (folderOpened.ok) {
+      await scrollLearnAfterElementOpen(folderOpened.row || folderOpened.button || null);
+      return {
+        ok: true,
+        action,
+        label: folderOpened.label,
+        url: folderOpened.url || ""
+      };
+    }
     const xpathOpened = openLearnXPathCardByQuery(LEARN_ASSESSMENT_CARD_XPATH, query, "assessment");
     const opened = xpathOpened.ok
       ? xpathOpened
       : await openLearnContentCardByQuery(query);
     if (!opened.ok) return opened;
+    await scrollLearnAfterElementOpen(opened.clickable || opened.node || opened.card || null);
     return {
       ok: true,
       action,
@@ -3241,6 +3765,28 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
     }
   }
+  if (message.type === "aqual-skyscanner-ring-nav") {
+    if (window.top !== window) {
+      sendResponse({ ok: false, error: "Skyscanner ring navigation is only available in the top frame." });
+      return false;
+    }
+    const payload = message.payload || {};
+    const action = String(payload.action || "").trim().toLowerCase();
+    if (action === "move-up") {
+      sendResponse(moveSkyscannerRingSelection(-1));
+      return false;
+    }
+    if (action === "move-down") {
+      sendResponse(moveSkyscannerRingSelection(1));
+      return false;
+    }
+    if (action === "activate") {
+      sendResponse(activateSkyscannerRingSelection());
+      return false;
+    }
+    sendResponse({ ok: false, error: `Unsupported Skyscanner ring action "${action}".` });
+    return false;
+  }
   if (message.type === "aqual-learn-action") {
     if (window.top !== window) {
       return;
@@ -3280,7 +3826,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
   }
   if (message.type === "aqual-apply") {
-    applySettings(message.settings || {});
+    applySettings(message.settings || {}, message.meta || null);
   }
   if (message.type === "aqual-print") {
     window.print();
@@ -3299,18 +3845,45 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 });
 
-chrome.storage.sync.get({ ...DEFAULTS, aqualRingButtonActions: RING_BUTTON_ACTION_DEFAULTS }, (stored) => {
-  const initialSettings = { ...(stored || {}), readingModeEnabled: false };
-  applySettings(initialSettings);
-  updateReadingModeStatus("disabled", "Reading mode is off.");
-  reportReadingModeState(false);
-  ringButtonActionOverrides = normalizeRingButtonActions(stored ? stored.aqualRingButtonActions : null);
-  chrome.storage.local.get(RING_EVENT_POLL_DEFAULTS, (localStored) => {
-    if (!localStored || localStored.aqualRingBackendPollingEnabled !== false) {
-      startRingBackendPolling();
-    } else {
-      stopRingBackendPolling();
-    }
+function requestCurrentUrlSettings(callback) {
+  const fallback = { ...DEFAULTS, readingModeEnabled: false };
+  try {
+    chrome.runtime.sendMessage(
+      { type: "aqual-get-settings-for-url", url: window.location.href },
+      (response) => {
+        if (chrome.runtime.lastError || !response || response.ok !== true || !response.settings) {
+          callback(fallback);
+          return;
+        }
+        callback({ ...DEFAULTS, ...response.settings, readingModeEnabled: false });
+      }
+    );
+  } catch (_error) {
+    callback(fallback);
+  }
+}
+
+requestCurrentUrlSettings((initialSettings) => {
+  chrome.storage.sync.get({ aqualRingButtonActions: RING_BUTTON_ACTION_DEFAULTS }, (stored) => {
+    applySettings(initialSettings, { source: "content-script", reason: "initial_settings_load" });
+    updateReadingModeStatus("disabled", "Reading mode is off.");
+    reportReadingModeState(false);
+    ringButtonActionOverrides = normalizeRingButtonActions(stored ? stored.aqualRingButtonActions : null);
+    chrome.storage.local.get(
+      { ...RING_EVENT_POLL_DEFAULTS, [RING_EVENT_CURSOR_STORAGE_KEY]: 0 },
+      (localStored) => {
+        ringEventCursor = normalizeRingCursorValue(localStored ? localStored[RING_EVENT_CURSOR_STORAGE_KEY] : 0);
+        ringEventCursorHydrated = ringEventCursor > 0;
+        if (ringEventCursorHydrated) {
+          featureTrace("ring_poll_cursor_restore", { cursor: ringEventCursor });
+        }
+        if (!localStored || localStored.aqualRingBackendPollingEnabled !== false) {
+          startRingBackendPolling();
+        } else {
+          stopRingBackendPolling();
+        }
+      }
+    );
   });
 });
 
@@ -3676,8 +4249,16 @@ function requestLineGuidePaint() {
   });
 }
 
-function setLineGuideEnabled(enabled) {
-  lineGuideEnabled = Boolean(enabled);
+function setLineGuideEnabled(enabled, initiator = "unknown") {
+  const nextEnabled = Boolean(enabled);
+  const previousEnabled = lineGuideEnabled;
+  lineGuideEnabled = nextEnabled;
+  if (previousEnabled !== lineGuideEnabled) {
+    featureTrace("line_guide_toggle", {
+      initiator: String(initiator || "unknown"),
+      enabled: lineGuideEnabled
+    });
+  }
   const overlay = ensureLineGuideOverlay();
   if (!lineGuideEnabled) {
     overlay.style.opacity = "0";
@@ -3689,12 +4270,19 @@ function setLineGuideEnabled(enabled) {
 
 function persistLineGuideSetting(enabled) {
   try {
-    if (!chrome || !chrome.storage || !chrome.storage.sync || !chrome.storage.sync.set) return;
-    chrome.storage.sync.set({ lineGuideEnabled: Boolean(enabled) }, () => {
-      if (chrome.runtime && chrome.runtime.lastError) {
-        // Ignore storage sync failures; state already applied locally.
+    if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) return;
+    chrome.runtime.sendMessage(
+      {
+        type: "aqual-update-settings-for-url",
+        url: window.location.href,
+        patch: { lineGuideEnabled: Boolean(enabled) }
+      },
+      () => {
+        if (chrome.runtime && chrome.runtime.lastError) {
+          // Ignore storage update failures; state already applied locally.
+        }
       }
-    });
+    );
   } catch (_error) {
     // Ignore extension context errors.
   }
@@ -3963,6 +4551,36 @@ function safeRuntimeMessage(payload) {
   }
 }
 
+function pollRingBackendViaRuntime(cursor) {
+  return new Promise((resolve, reject) => {
+    try {
+      if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) {
+        resolve(null);
+        return;
+      }
+      chrome.runtime.sendMessage(
+        {
+          type: "aqual-ring-backend-poll",
+          cursor: Number.isFinite(Number(cursor)) ? Number(cursor) : 0
+        },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message || "Ring backend poll request failed."));
+            return;
+          }
+          if (!response || response.ok !== true) {
+            reject(new Error(response && response.error ? String(response.error) : "Ring backend poll unavailable."));
+            return;
+          }
+          resolve(response.data || null);
+        }
+      );
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 async function pollRingBackendEvents() {
   if (ringEventPollInFlight) return;
   if (window.top !== window) return;
@@ -3970,38 +4588,76 @@ async function pollRingBackendEvents() {
 
   ringEventPollInFlight = true;
   try {
-    const url = `${RING_EVENT_POLL_ENDPOINT}?cursor=${encodeURIComponent(String(ringEventCursor || 0))}`;
-    const response = await fetch(url, { method: "GET", cache: "no-store" });
-    if (!response.ok) {
-      return;
-    }
-
-    const data = await response.json();
-    const nextCursor = Number(data && data.cursor);
+    const pollCursor = normalizeRingCursorValue(ringEventCursor);
+    const wasHydratedBeforePoll = ringEventCursorHydrated;
+    const data = await pollRingBackendViaRuntime(pollCursor);
+    if (!data || typeof data !== "object") return;
+    const nextCursor = normalizeRingCursorValue(data && data.cursor);
     const delta = Number(data && data.delta);
     const events = Array.isArray(data && data.events) ? data.events : [];
-    if (Number.isFinite(nextCursor) && nextCursor >= 0) {
+    if (nextCursor !== ringEventCursor) {
       ringEventCursor = nextCursor;
-    }
-    if (!Number.isFinite(delta) || delta <= 0) {
-      return;
+      persistRingEventCursor(nextCursor);
     }
 
-    if (events.length > 0) {
-      for (const entry of events) {
+    let eventsToProcess = events;
+    if (!wasHydratedBeforePoll) {
+      ringEventCursorHydrated = true;
+      eventsToProcess = events.filter((entry) => {
+        const eventTsMs = parseRingEventTimestampMs(entry);
+        return Number.isFinite(eventTsMs)
+          && eventTsMs >= (ringEventSessionStartedAtMs - RING_EVENT_INITIAL_SYNC_GRACE_MS);
+      });
+      const droppedCount = Math.max(0, events.length - eventsToProcess.length);
+      featureTrace("ring_poll_initial_sync", {
+        requestedCursor: pollCursor,
+        serverCursor: ringEventCursor,
+        keptEvents: eventsToProcess.length,
+        droppedEvents: droppedCount
+      });
+    } else {
+      ringEventCursorHydrated = true;
+    }
+
+    if (eventsToProcess.length > 0) {
+      for (const entry of eventsToProcess) {
         const payload = entry && typeof entry === "object" ? (entry.payload || {}) : {};
-        const actionToken = String(payload.action || "").trim().toLowerCase();
         const buttonLabel = String(payload.buttonLabel || "").trim().toLowerCase();
+        const entryCursor = normalizeRingCursorValue(entry && entry.cursor);
+        const now = Date.now();
+
+        if (isSkyscannerRingNavButton(buttonLabel) && isSkyscannerFlightsResultsPageUrl(window.location.href)) {
+          const navDebounceKey = `skyscanner_nav:${buttonLabel}`;
+          const lastNavAt = Number(ringEventLastActionAt[navDebounceKey] || 0);
+          if (now - lastNavAt < RING_EVENT_LOCAL_DEBOUNCE_MS) {
+            continue;
+          }
+          const handled = performSkyscannerRingNavigation(buttonLabel);
+          if (handled) {
+            ringEventLastActionAt[navDebounceKey] = now;
+            featureTrace("ring_poll_skyscanner_nav", {
+              buttonLabel,
+              cursor: entryCursor
+            });
+            continue;
+          }
+        }
+
+        const actionToken = String(payload.action || "").trim().toLowerCase();
         const action = resolveRingActionForPayload(buttonLabel, actionToken);
         if (!action || action === "none") {
           continue;
         }
-        const now = Date.now();
         const lastAt = Number(ringEventLastActionAt[action] || 0);
         if (now - lastAt < RING_EVENT_LOCAL_DEBOUNCE_MS) {
           continue;
         }
         ringEventLastActionAt[action] = now;
+        featureTrace("ring_poll_action_dispatch", {
+          action,
+          buttonLabel,
+          cursor: entryCursor
+        });
         safeRuntimeMessage({
           type: "aqual-ring-backend-action",
           source: "ring-event-poll",
@@ -4009,6 +4665,13 @@ async function pollRingBackendEvents() {
           buttonLabel
         });
       }
+      return;
+    }
+
+    if (!wasHydratedBeforePoll) {
+      return;
+    }
+    if (!Number.isFinite(delta) || delta <= 0) {
       return;
     }
 
@@ -4023,6 +4686,10 @@ async function pollRingBackendEvents() {
     }
     ringEventLastToggleAt = now;
     ringEventLastActionAt.toggle_voice_mic = now;
+    featureTrace("ring_poll_parity_fallback_dispatch", {
+      delta: Math.trunc(delta),
+      cursor: ringEventCursor
+    });
     safeRuntimeMessage({
       type: "aqual-ring-backend-action",
       source: "ring-event-poll",
@@ -4048,13 +4715,16 @@ function startRingBackendPolling() {
     });
   }, RING_EVENT_POLL_INTERVAL_MS);
 
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") {
-      pollRingBackendEvents().catch(() => {
-        // Ignore wake-up polling errors.
-      });
-    }
-  });
+  if (!ringEventVisibilityListenerBound) {
+    ringEventVisibilityListenerBound = true;
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        pollRingBackendEvents().catch(() => {
+          // Ignore wake-up polling errors.
+        });
+      }
+    });
+  }
 }
 
 function stopRingBackendPolling() {
@@ -4104,7 +4774,7 @@ document.addEventListener("keydown", (event) => {
   if (!event.repeat && isAltDown && isBDown) {
     event.preventDefault();
     const nextEnabled = !lineGuideEnabled;
-    setLineGuideEnabled(nextEnabled);
+    setLineGuideEnabled(nextEnabled, "keyboard_alt_b");
     state = { ...state, lineGuideEnabled: nextEnabled };
     persistLineGuideSetting(nextEnabled);
     return;
