@@ -301,7 +301,7 @@ const RING_ACTION_TOGGLE_MAP = {
   toggle_cursor: { key: "cursorEnabled", label: "pointer style" },
   toggle_image_veil: { key: "imageVeilEnabled", label: "image veil" },
   toggle_highlight: { key: "highlightEnabled", label: "highlight words" },
-  toggle_line_guide: { key: "lineGuideEnabled", label: "BeeLine line guide" },
+  toggle_line_guide: { key: "lineGuideEnabled", label: "Line Guidance" },
   toggle_drawing: { key: "drawingEnabled", label: "drawing mode" },
   toggle_magnifier: { key: "magnifierEnabled", label: "magnifier" }
 };
@@ -714,10 +714,48 @@ function maybeHandleSkyscannerRingNavigationOverride(source = "ring-backend-moni
   return true;
 }
 
+function maybeHandleGoogleDocsRingArrowOverride(source = "ring-backend-monitor", buttonLabel = "", sender = null) {
+  const ringButton = String(buttonLabel || "").trim().toLowerCase();
+  const keyAction = (ringButton === "left" || ringButton === "prev" || ringButton === "previous" || ringButton === "back")
+    ? "key_arrow_left"
+    : (ringButton === "right" || ringButton === "next" || ringButton === "forward")
+      ? "key_arrow_right"
+      : "";
+  if (!keyAction) {
+    return false;
+  }
+
+  const tabId = getRingTargetTabId(sender);
+  const tabUrl = String(sender && sender.tab && sender.tab.url ? sender.tab.url : "");
+  if (!(Number.isFinite(tabId) && tabId > 0)) {
+    return false;
+  }
+  if (!tabUrl || !isGoogleDocsTabUrl(tabUrl)) {
+    return false;
+  }
+
+  const statusLabel = keyAction === "key_arrow_left"
+    ? "Google Docs arrow left"
+    : "Google Docs arrow right";
+  sendRingCommandToTargetTab(
+    { type: "aqual-ring-key-command", action: keyAction },
+    source,
+    buttonLabel,
+    sender,
+    statusLabel
+  );
+  return true;
+}
+
 function executeRingBackendAction(action, source = "ring-backend-monitor", buttonLabel = "", sender = null) {
   const actionToken = String(action || "").trim().toLowerCase();
   const sourceLabel = String(source || "ring");
   const targetTabId = getRingTargetTabId(sender);
+
+  if (maybeHandleGoogleDocsRingArrowOverride(source, buttonLabel, sender)) {
+    return true;
+  }
+
   if (!actionToken || actionToken === "none") {
     return true;
   }
@@ -757,7 +795,7 @@ function executeRingBackendAction(action, source = "ring-backend-monitor", butto
     }
     geminiLiveLastToggleAt = now;
     toggleGeminiLiveCall(sender);
-    setRingStatus(`Ring ${ringButtonPrefix(buttonLabel)}Gemini Live call ${nextStateOn ? "ON" : "OFF"} (${sourceLabel}).`);
+    setRingStatus(`Ring ${ringButtonPrefix(buttonLabel)}AQual Live call ${nextStateOn ? "ON" : "OFF"} (${sourceLabel}).`);
     return true;
   }
 
@@ -1943,6 +1981,17 @@ function isSkyscannerFlightsTabUrl(url) {
     const parsed = new URL(url);
     return parsed.hostname.toLowerCase().includes("skyscanner.")
       && parsed.pathname.includes("/transport/flights/");
+  } catch (_error) {
+    return false;
+  }
+}
+
+function isGoogleDocsTabUrl(url) {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol.toLowerCase() === "https:"
+      && parsed.hostname.toLowerCase() === "docs.google.com";
   } catch (_error) {
     return false;
   }
@@ -4322,22 +4371,65 @@ function extractNumericDayFromDateText(normalizedDateText) {
   return null;
 }
 
-function extractTwoDigitYearFromDateText(normalizedDateText) {
-  const fourDigit = normalizedDateText.match(/\b(19|20)\d{2}\b/);
+function getCurrentTwoDigitYear() {
+  return new Date().getFullYear() % 100;
+}
+
+function normalizeTwoDigitYearToken(rawYear) {
+  const token = String(rawYear || "").trim();
+  if (!token) return null;
+  const numeric = Number(token);
+  if (!Number.isFinite(numeric)) return null;
+  if (token.length >= 4) {
+    return Number(String(Math.trunc(numeric)).slice(-2));
+  }
+  if (numeric < 0 || numeric > 99) return null;
+  return Math.trunc(numeric);
+}
+
+function extractTwoDigitYearFromDateText(rawDateText, normalizedDateText) {
+  const raw = String(rawDateText || "");
+  const normalized = String(normalizedDateText || "").trim().toLowerCase();
+  const monthPattern = `(?:${DATE_MONTH_REGEX_SOURCE})`;
+
+  // Explicit four-digit year: "2026", "March 22 2026", "22 March 2026"
+  const fourDigit = raw.match(/\b(19|20)\d{2}\b/);
   if (fourDigit) {
     return Number(String(fourDigit[0]).slice(-2));
   }
-  const twoDigit = normalizedDateText.match(/\b(\d{2})\b/g);
-  if (!twoDigit || !twoDigit.length) {
-    return 26;
+
+  // Explicit year keyword: "year 26", "year 2026"
+  const yearKeyword = raw.match(/\byear\s+(\d{2,4})\b/i);
+  if (yearKeyword) {
+    const parsed = normalizeTwoDigitYearToken(yearKeyword[1]);
+    if (parsed !== null) return parsed;
   }
-  for (let i = 0; i < twoDigit.length; i += 1) {
-    const value = Number(twoDigit[i]);
-    if (value >= 24 && value <= 99) {
-      return value;
-    }
+
+  // Apostrophe year: "March 22 '26"
+  const apostropheYear = raw.match(/\b['’](\d{2})\b/);
+  if (apostropheYear) {
+    const parsed = normalizeTwoDigitYearToken(apostropheYear[1]);
+    if (parsed !== null) return parsed;
   }
-  return 26;
+
+  // Month/day with trailing year: "March 22 26" or "22 March 26"
+  const monthDayYear = normalized.match(
+    new RegExp(`\\b${monthPattern}\\s+\\d{1,2}(?:st|nd|rd|th)?\\s+(\\d{2,4})\\b`, "i")
+  );
+  if (monthDayYear) {
+    const parsed = normalizeTwoDigitYearToken(monthDayYear[1]);
+    if (parsed !== null) return parsed;
+  }
+  const dayMonthYear = normalized.match(
+    new RegExp(`\\b\\d{1,2}(?:st|nd|rd|th)?\\s*(?:of\\s+)?${monthPattern}\\s+(\\d{2,4})\\b`, "i")
+  );
+  if (dayMonthYear) {
+    const parsed = normalizeTwoDigitYearToken(dayMonthYear[1]);
+    if (parsed !== null) return parsed;
+  }
+
+  // No explicit year spoken: use current year.
+  return getCurrentTwoDigitYear();
 }
 
 function getCountryCode(country) {
@@ -4353,6 +4445,7 @@ function parseDate(dateStr) {
   const normalizedInput = normalizeDateTextInput(dateStr);
   const lower = normalizedInput.toLowerCase().trim();
   let day = null;
+  const currentYear = getCurrentTwoDigitYear();
 
   const yearFirstMatch = lower.match(/\b((?:19|20)\d{2})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b/);
   if (yearFirstMatch) {
@@ -4368,7 +4461,7 @@ function parseDate(dateStr) {
   if (numericMatch) {
     let first = Number(numericMatch[1]);
     let second = Number(numericMatch[2]);
-    let year = numericMatch[3] ? Number(numericMatch[3]) : 26;
+    let year = numericMatch[3] ? Number(numericMatch[3]) : currentYear;
     if (year > 99) {
       year = Number(String(year).slice(-2));
     }
@@ -4410,8 +4503,52 @@ function parseDate(dateStr) {
   const month = extractMonthFromDateText(lower);
   if (!month) return null;
 
-  const year = String(extractTwoDigitYearFromDateText(lower)).padStart(2, "0");
+  const year = String(extractTwoDigitYearFromDateText(dateStr, lower)).padStart(2, "0");
   return `${year}${month}${day}`;
+}
+
+function parseSkyscannerDateCodeToDate(dateCode) {
+  const token = String(dateCode || "").trim();
+  if (!/^\d{6}$/.test(token)) return null;
+  const year = 2000 + Number(token.slice(0, 2));
+  const month = Number(token.slice(2, 4));
+  const day = Number(token.slice(4, 6));
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const parsed = new Date(year, month - 1, day);
+  if (parsed.getFullYear() !== year || (parsed.getMonth() + 1) !== month || parsed.getDate() !== day) {
+    return null;
+  }
+  return parsed;
+}
+
+function formatDateToSkyscannerCode(dateValue) {
+  if (!(dateValue instanceof Date) || Number.isNaN(dateValue.getTime())) return "";
+  const yy = String(dateValue.getFullYear() % 100).padStart(2, "0");
+  const mm = String(dateValue.getMonth() + 1).padStart(2, "0");
+  const dd = String(dateValue.getDate()).padStart(2, "0");
+  return `${yy}${mm}${dd}`;
+}
+
+function normalizeRoundTripDateOrder(departDateCode, returnDateCode) {
+  const departDate = parseSkyscannerDateCodeToDate(departDateCode);
+  const returnDate = parseSkyscannerDateCodeToDate(returnDateCode);
+  if (!departDate || !returnDate) {
+    return {
+      departDateCode,
+      returnDateCode
+    };
+  }
+
+  const adjustedReturn = new Date(returnDate.getTime());
+  while (adjustedReturn < departDate) {
+    adjustedReturn.setFullYear(adjustedReturn.getFullYear() + 1);
+  }
+
+  return {
+    departDateCode,
+    returnDateCode: formatDateToSkyscannerCode(adjustedReturn) || returnDateCode
+  };
 }
 
 function extractDates(text) {
@@ -4661,7 +4798,11 @@ function buildSkyscannerUrl(booking) {
     return null;
   }
 
-  return `https://www.skyscanner.net/transport/flights/${originCode}/${destCode}/${departDate}/${returnDate}/?adultsv2=1&cabinclass=economy&childrenv2=&ref=home&rtn=1&preferdirects=false&outboundaltsenabled=false&inboundaltsenabled=false`;
+  const normalizedRoundTrip = normalizeRoundTripDateOrder(departDate, returnDate);
+  const finalDepartDate = normalizedRoundTrip.departDateCode || departDate;
+  const finalReturnDate = normalizedRoundTrip.returnDateCode || returnDate;
+
+  return `https://www.skyscanner.net/transport/flights/${originCode}/${destCode}/${finalDepartDate}/${finalReturnDate}/?adultsv2=1&cabinclass=economy&childrenv2=&ref=home&rtn=1&preferdirects=false&outboundaltsenabled=false&inboundaltsenabled=false`;
 }
 
 async function ensureOffscreenDocument() {
@@ -4674,7 +4815,7 @@ async function ensureOffscreenDocument() {
     await chrome.offscreen.createDocument({
       url: "offscreen-audio.html",
       reasons: ["USER_MEDIA", "AUDIO_PLAYBACK"],
-      justification: "Capture mic audio and play Gemini Live voice responses."
+      justification: "Capture mic audio and play AQual Live voice responses."
     });
   } catch (error) {
     // Ignore if offscreen creation fails; popup recording still works.
@@ -4816,7 +4957,7 @@ async function requestGeminiLiveResponse(payload, signal) {
     data = {};
   }
   if (!response.ok || (data && data.error)) {
-    throw new Error((data && data.error) || `Gemini Live request failed (${response.status})`);
+    throw new Error((data && data.error) || `AQual Live request failed (${response.status})`);
   }
   return data;
 }
@@ -5012,7 +5153,7 @@ async function processGeminiLiveQueue() {
         if (geminiLiveLastTabId) {
           sendGeminiLiveMessageToTab(geminiLiveLastTabId, {
             type: "aqual-gemini-live-status",
-            status: "Gemini Live",
+            status: "AQual Live",
             detail: `Live call chunk failed: ${error && error.message ? error.message : "unknown error"}`,
             sticky: true
           });
@@ -5058,7 +5199,7 @@ function startGeminiLiveCall(sender = null) {
 
   sendGeminiLiveMessageToTab(geminiLiveCallTabId, {
     type: "aqual-gemini-live-status",
-    status: "Gemini Live",
+    status: "AQual Live",
     detail: "Live call ON. Connecting...",
     sticky: true
   });
@@ -5123,7 +5264,7 @@ function stopGeminiLiveCall(reason = "Live call stopped.", notify = true) {
   if (notify && targetTabId) {
     sendGeminiLiveMessageToTab(targetTabId, {
       type: "aqual-gemini-live-status",
-      status: "Gemini Live",
+      status: "AQual Live",
       detail: reason,
       sticky: true
     });
@@ -5171,7 +5312,7 @@ function startGeminiLiveHoldSession(incomingHoldId = 0, sender = null) {
 
   sendGeminiLiveMessageToTab(senderTabId, {
     type: "aqual-gemini-live-status",
-    status: "Gemini Live",
+    status: "AQual Live",
     detail: "Listening... release Alt+D to send.",
     sticky: false
   });
@@ -5216,7 +5357,7 @@ function stopGeminiLiveHoldSession(incomingHoldId = 0, sender = null) {
 
   sendGeminiLiveMessageToTab(geminiLivePending.tabId || senderTabId, {
     type: "aqual-gemini-live-status",
-    status: "Gemini Live",
+    status: "AQual Live",
     detail: "Processing your question...",
     sticky: true
   });
@@ -5235,7 +5376,7 @@ function stopGeminiLiveHoldSession(incomingHoldId = 0, sender = null) {
     sendGeminiLiveMessageToTab(timedOut.tabId || 0, {
       type: "aqual-gemini-live-result",
       ok: false,
-      error: "Gemini Live capture timed out. Please try again."
+      error: "AQual Live capture timed out. Please try again."
     });
   }, 45000);
 }
@@ -5280,7 +5421,7 @@ async function handleGeminiLiveCapturedAudio(message) {
 
     sendGeminiLiveMessageToTab(tab && tab.id ? tab.id : pending.tabId, {
       type: "aqual-gemini-live-status",
-      status: "Gemini Live",
+      status: "AQual Live",
       detail: "Sending audio + screenshot to Gemini...",
       sticky: true
     });
@@ -5352,7 +5493,7 @@ async function handleGeminiLiveCapturedAudio(message) {
     sendGeminiLiveMessageToTab(pending.tabId || 0, {
       type: "aqual-gemini-live-result",
       ok: false,
-      error: error && error.message ? error.message : "Gemini Live request failed."
+      error: error && error.message ? error.message : "AQual Live request failed."
     });
   } finally {
     if (geminiLivePending && geminiLivePending.holdId === holdId) {
@@ -5917,7 +6058,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (transcriptText) {
         sendGeminiLiveMessageToTab(geminiLiveLastTabId, {
           type: "aqual-gemini-live-status",
-          status: "Gemini Live",
+          status: "AQual Live",
           detail: `You: ${transcriptText}`,
           sticky: true
         });
@@ -5940,23 +6081,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (state === "connecting" && geminiLiveLastTabId) {
       sendGeminiLiveMessageToTab(geminiLiveLastTabId, {
         type: "aqual-gemini-live-status",
-        status: "Gemini Live",
-        detail: "Connecting to Gemini Live...",
+        status: "AQual Live",
+        detail: "Connecting to AQual Live...",
         sticky: true
       });
     }
     if (state === "reconnecting" && geminiLiveLastTabId) {
       sendGeminiLiveMessageToTab(geminiLiveLastTabId, {
         type: "aqual-gemini-live-status",
-        status: "Gemini Live",
-        detail: "Reconnecting to Gemini Live...",
+        status: "AQual Live",
+        detail: "Reconnecting to AQual Live...",
         sticky: true
       });
     }
     if ((state === "ready" || state === "listening") && geminiLiveLastTabId) {
       sendGeminiLiveMessageToTab(geminiLiveLastTabId, {
         type: "aqual-gemini-live-status",
-        status: "Gemini Live",
+        status: "AQual Live",
         detail: "Live call ON. Listening...",
         sticky: true
       });
@@ -5964,7 +6105,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (state === "responding" && geminiLiveLastTabId) {
       sendGeminiLiveMessageToTab(geminiLiveLastTabId, {
         type: "aqual-gemini-live-status",
-        status: "Gemini Live",
+        status: "AQual Live",
         detail: "Gemini is responding...",
         sticky: true
       });
@@ -5972,7 +6113,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (state === "stopped" && geminiLiveLastTabId) {
       sendGeminiLiveMessageToTab(geminiLiveLastTabId, {
         type: "aqual-gemini-live-status",
-        status: "Gemini Live",
+        status: "AQual Live",
         detail: "Live call OFF.",
         sticky: true
       });
@@ -6000,7 +6141,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (state === "error" && geminiLiveLastTabId) {
       sendGeminiLiveMessageToTab(geminiLiveLastTabId, {
         type: "aqual-gemini-live-status",
-        status: "Gemini Live",
+        status: "AQual Live",
         detail: `Voice playback failed: ${errorText || "unknown error"}`,
         sticky: true
       });
